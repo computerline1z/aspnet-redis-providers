@@ -4,6 +4,7 @@
 //
 
 using System;
+using System.CodeDom;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Specialized;
@@ -16,11 +17,47 @@ namespace Microsoft.Web.Redis
        during any request cycle. We use this list to indentify if we want to change any session item or not.*/
     internal class ChangeTrackingSessionStateItemCollection : NameObjectCollectionBase, ISessionStateItemCollection, ICollection, IEnumerable
     {
+        private readonly RedisUtility redisUtility;
         SessionStateItemCollection innerCollection;
         // key is "session key in lowercase" and value is "actual session key in actual case"
         Dictionary<string, string> allKeys = new Dictionary<string, string>();
+        SerializedItems serializedItems = new SerializedItems();
+        object serializedItemsLock = new object();
         HashSet<string> modifiedKeys = new HashSet<string>();
         HashSet<string> deletedKeys = new HashSet<string>();
+
+        internal class SerializedItems : NameObjectCollectionBase
+        {
+            public void Set(string key, object value)
+            {
+                BaseSet(key, value);
+            }
+
+            public void Clear()
+            {
+                BaseClear();
+            }
+
+            public void Remove(string name)
+            {
+                BaseRemove(name);
+            }
+
+            public void RemoveAt(int index)
+            {
+                BaseRemoveAt(index);
+            }
+
+            public object Get(string name)
+            {
+                return BaseGet(name);
+            }
+
+            public object Get(int index)
+            {
+                return BaseGet(index);
+            }
+        }
 
         private string GetSessionNormalizedKeyToUse(string name)
         { 
@@ -52,6 +89,18 @@ namespace Microsoft.Web.Redis
             }
             deletedKeys.Add(key);
         }
+
+        public void AddSerializedData(string name, byte[] value)
+        {
+            name = GetSessionNormalizedKeyToUse(name);
+            // This keeps the order of the two collections equal
+            // innerCollection[name] and serializedItems.Set() both call down to BaseSet()
+            lock (serializedItemsLock)
+            {
+                serializedItems.Set(name, value);
+                innerCollection[name] = null;
+            }
+        }
         
         public HashSet<string> GetModifiedKeys()
         {
@@ -68,13 +117,23 @@ namespace Microsoft.Web.Redis
             innerCollection = new SessionStateItemCollection();
         }
 
+        public ChangeTrackingSessionStateItemCollection(RedisUtility redisUtility)
+        {
+            this.redisUtility = redisUtility;
+            innerCollection = new SessionStateItemCollection();
+        }
+
         public void Clear()
         {
             foreach (string key in innerCollection.Keys) 
             {
                 addInDeletedKeys(key);
             }
-            innerCollection.Clear();
+            lock (serializedItemsLock)
+            {
+                innerCollection.Clear();
+                serializedItems.Clear();
+            }
         }
 
         public bool Dirty
@@ -106,7 +165,11 @@ namespace Microsoft.Web.Redis
             {
                 addInDeletedKeys(name);
             }
-            innerCollection.Remove(name);
+            lock (serializedItemsLock)
+            {
+                innerCollection.Remove(name);
+                serializedItems.Remove(name);
+            }
         }
 
         public void RemoveAt(int index)
@@ -115,18 +178,51 @@ namespace Microsoft.Web.Redis
             {
                 addInDeletedKeys(innerCollection.Keys[index]);
             }
-            innerCollection.RemoveAt(index);
+            lock (serializedItemsLock)
+            {
+                innerCollection.RemoveAt(index);
+                if (serializedItems.Count > index) serializedItems.RemoveAt(index);
+            }
+        }
+
+        private object internalGet(int index)
+        {
+            var obj = innerCollection[index];
+            if (obj != null || redisUtility == null) return obj;
+            object serializedItem;
+            lock (serializedItemsLock)
+            {
+                serializedItem = serializedItems.Get(index);
+            }
+            if (serializedItem == null) return null;
+            innerCollection[index] = obj = redisUtility.GetObjectFromBytes((byte[])serializedItem);
+            return obj;
+        }
+
+        private object internalGet(string name)
+        {
+            var obj = innerCollection[name];
+            if (obj != null || redisUtility == null) return obj;
+            object serializedItem;
+            lock (serializedItemsLock)
+            {
+                serializedItem = serializedItems.Get(name);
+            }
+            if (serializedItem == null) return null;
+            innerCollection[name] = obj = redisUtility.GetObjectFromBytes((byte[])serializedItem);
+            return obj;
         }
 
         public object this[int index]
         {
             get
             {
-                if (IsMutable(innerCollection[index]))
+                var item = internalGet(index);
+                if (IsMutable(item))
                 {
                     addInModifiedKeys(innerCollection.Keys[index]);
                 }
-                return innerCollection[index];
+                return item;
             }
             set
             {
@@ -140,11 +236,12 @@ namespace Microsoft.Web.Redis
             get
             {
                 name = GetSessionNormalizedKeyToUse(name);
-                if (IsMutable(innerCollection[name]))
+                var item = internalGet(name);
+                if (IsMutable(item))
                 {
                     addInModifiedKeys(name);
                 }
-                return innerCollection[name];
+                return item;
             }
             set
             {
